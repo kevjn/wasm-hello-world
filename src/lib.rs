@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{WebGlProgram, WebGl2RenderingContext, WebGlShader};
@@ -17,22 +19,41 @@ pub fn start() -> Result<(), JsValue> {
         &context,
         WebGl2RenderingContext::VERTEX_SHADER,
         r##"#version 300 es
-        in vec2 position;
+        in vec2 pos;
         const float PI = 3.1415926535897932384626433832795;
+        uniform vec2 angle;
 
         float degToRad(float v) {
             return v * PI / 180.0;
         }
 
+        mat4 rotateY(float r) {
+            float s = sin(r), c = cos(r);
+            // left handed rotation
+            return mat4(c,   0.0, -s,  0.0, 
+                        0.0, 1.0, 0.0, 0.0, 
+                        s,   0.0, c,   0.0, 
+                        0.0, 0.0, 0.0, 1.0);
+        }
+
+        mat4 rotateX(float r) {
+            float s = sin(r), c = cos(r);
+            // left handed rotation
+            return mat4(1.0, 0.0, 0.0, 0.0, 
+                        0.0, c,   s,   0.0, 
+                        0.0, -s,  c,   0.0, 
+                        0.0, 0.0, 0.0, 1.0);
+        }
+
         void main() {
-            float lat = degToRad(position.y);
-            float lon = degToRad(position.x);
+            float lat = degToRad(pos.y);
+            float lon = degToRad(pos.x);
 
             float z = cos(lat) * cos(lon);
             float x = cos(lat) * sin(lon);
             float y = sin(lat);
 
-            gl_Position = vec4(x, y, z, 1.0);
+            gl_Position = rotateX(angle[0]) * rotateY(angle[1]) * vec4(x, y, z, 1.0);
         }
     "##,
     )?;
@@ -48,14 +69,13 @@ pub fn start() -> Result<(), JsValue> {
               outColor = vec4(0.0, 0.8, 0.0, 1.0); // green
             else
               outColor = vec4(0.8, 0.8, 0.8, 1.0);
-
         }
     "##,
     )?;
     let program = link_program(&context, &vert_shader, &frag_shader)?;
     context.use_program(Some(&program));
 
-    let position_attribute_location = context.get_attrib_location(&program, "position");
+    let position_attribute_location = context.get_attrib_location(&program, "pos");
     let buffer = context.create_buffer().ok_or("failed to create buffer")?;
     context.bind_buffer(WebGl2RenderingContext::ARRAY_BUFFER, Some(&buffer));
 
@@ -92,9 +112,53 @@ pub fn start() -> Result<(), JsValue> {
 
     context.bind_vertex_array(Some(&vao));
 
-    context.enable(WebGl2RenderingContext::DEPTH_TEST); // maybe remove this
+    context.enable(WebGl2RenderingContext::DEPTH_TEST);
+
+    let location = context.get_uniform_location(&program, "angle");
+    let mut angle = [0.0, 0.0];
+    context.uniform2fv_with_f32_array(location.as_ref(), &angle);
 
     draw(&context, vert_count);
+
+    // add mouse handlers
+    let pressed = Rc::new(Cell::new(false));
+    // mouse down event
+    {
+        let pressed = pressed.clone();
+        let closure: Closure<dyn FnMut(_)> = Closure::wrap(Box::new(move |_event: web_sys::MouseEvent| {
+            pressed.set(true);
+        }));
+        canvas.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+    // mouse move event
+    {
+        let context = context.clone();
+        let pressed = pressed.clone();
+        let closure: Closure<dyn FnMut(_)> = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+            if pressed.get() {
+                angle[0] += (event.movement_y() as f32) / 720.0;
+                angle[1] += (event.movement_x() as f32) / 720.0;
+
+                // clamp angle for north/south pole
+                angle[0] = angle[0].clamp(-1.0, 1.0);
+
+                context.uniform2fv_with_f32_array(location.as_ref(), &angle);
+                draw(&context, vert_count);
+            }
+        }));
+        document.add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+    // mouse up event
+    {
+        let pressed = pressed.clone();
+        let closure: Closure<dyn FnMut(_)> = Closure::wrap(Box::new(move |_event: web_sys::MouseEvent| {
+            pressed.set(false);
+        }));
+        document.add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
 
     Ok(())
 }
