@@ -1,8 +1,46 @@
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use web_sys::CanvasRenderingContext2d;
 use web_sys::{WebGlProgram, WebGl2RenderingContext, WebGlShader};
+
+struct Peer {
+    lat: f64,
+    lon: f64,
+    x: f64,
+    y: f64
+}
+
+impl Peer {
+    fn new(lat: f64, lon: f64) -> Peer {
+        // convert degrees to radians
+        let (lat, lon) = (lat * std::f64::consts::PI / 180.0, lon * std::f64::consts::PI / 180.0);
+        // calculate 2d cartesian coordinates
+        let (x,y, _) = Peer::cartesian(lat, lon);
+
+        Peer {lat, lon, x, y}
+    }
+
+    fn cartesian(lat: f64, lon: f64) -> (f64, f64, f64) {
+        (lat.cos() * lon.sin(), lat.sin(), lat.cos() * (lon + std::f64::consts::PI).cos())
+    }
+
+    fn rotate(&mut self, lat: f64, lon: f64) {
+        let (x, y, z) = Peer::cartesian(self.lat, self.lon);
+
+        self.x = lon.cos() * x - lon.sin() * z;
+        self.y = lat.cos() * y + lat.sin() * lon.cos() * z + lat.sin() * lon.sin() * x;
+    }
+
+    fn draw(&self, context: &CanvasRenderingContext2d) {
+        context.begin_path();
+        context.arc(self.x * 360.0 + 360.0, -self.y * 360.0 + 360.0, 4.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
+        context.set_fill_style(&JsValue::from_str("red"));
+        context.fill();
+    }
+}
 
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
@@ -49,9 +87,9 @@ pub fn start() -> Result<(), JsValue> {
             float lat = degToRad(pos.y);
             float lon = degToRad(pos.x);
 
-            float z = cos(lat) * cos(lon);
             float x = cos(lat) * sin(lon);
             float y = sin(lat);
+            float z = cos(lat) * cos(lon);
 
             gl_Position = rotateX(angle[0]) * rotateY(angle[1]) * vec4(x, y, z, 1.0);
         }
@@ -110,18 +148,56 @@ pub fn start() -> Result<(), JsValue> {
     context.vertex_attrib_pointer_with_i32(0, 2, WebGl2RenderingContext::FLOAT, false, 0, 0);
     context.enable_vertex_attrib_array(position_attribute_location as u32);
 
-    context.bind_vertex_array(Some(&vao));
-
     context.enable(WebGl2RenderingContext::DEPTH_TEST);
 
     let location = context.get_uniform_location(&program, "angle");
-    let mut angle = [0.0, 0.0];
-    context.uniform2fv_with_f32_array(location.as_ref(), &angle);
+    let angle = Rc::new(Cell::new([0.0,0.0]));
+    context.uniform2fv_with_f32_array(location.as_ref(), &angle.get());
 
-    draw(&context, vert_count);
+    let canvas = document.get_element_by_id("peers_canvas").unwrap();
+    let canvas: web_sys::HtmlCanvasElement = canvas.dyn_into::<web_sys::HtmlCanvasElement>()?;
+
+    // add some dummy data
+    let peers = vec![
+        Peer::new(59.334591, 18.063240),  // Stockholm
+        Peer::new(51.509865, -0.118092),  // London
+        Peer::new(40.730610, -73.935252), // New York
+        Peer::new(-19.002846, 46.460938), // Madagascar
+    ];
+
+    let peers = Rc::new(RefCell::new(peers));
+
+    // closure for drawing globe and peers
+    let draw = {
+        let peers = peers.clone();
+        let canvas_context = canvas.get_context("2d")?.unwrap().dyn_into::<web_sys::CanvasRenderingContext2d>()?;
+        move |lat: f32, lon: f32| {
+            // draw globe using webgl context
+            context.uniform2fv_with_f32_array(location.as_ref(), &[lat, lon]);
+            context.clear_color(0.98, 0.98, 0.98, 1.0);
+            context.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
+            context.draw_arrays(WebGl2RenderingContext::LINE_STRIP, 0, vert_count);
+
+            // draw globe frame
+            canvas_context.clear_rect(0.0, 0.0, 720.0, 720.0);
+            canvas_context.begin_path();
+            canvas_context.arc(360.0, 360.0, 360.0, 0.0, std::f64::consts::PI * 2.0).unwrap();
+            canvas_context.stroke();
+            canvas_context.close_path();
+            
+            // draw peers on map
+            for p in peers.borrow_mut().iter_mut() {
+                p.rotate(lat.into(), lon.into());
+                p.draw(&canvas_context);
+            }
+        }
+    };
+
+    draw(0.0, 0.0);
 
     // add mouse handlers
     let pressed = Rc::new(Cell::new(false));
+
     // mouse down event
     {
         let pressed = pressed.clone();
@@ -131,26 +207,31 @@ pub fn start() -> Result<(), JsValue> {
         canvas.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
         closure.forget();
     }
+
     // mouse move event
     {
-        let context = context.clone();
         let pressed = pressed.clone();
+        let angle = angle.clone();
+        let draw = draw.clone();
         let closure: Closure<dyn FnMut(_)> = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
             if pressed.get() {
-                angle[0] += (event.movement_y() as f32) / 720.0;
-                angle[1] += (event.movement_x() as f32) / 720.0;
+                let [mut lat, mut lon] = angle.get();
+                lat += (event.movement_y() as f32) / 720.0;
+                lon += (event.movement_x() as f32) / 720.0;
 
                 // clamp angle for north/south pole
-                angle[0] = angle[0].clamp(-1.0, 1.0);
+                lat = lat.clamp(-1.0, 1.0);
 
-                context.uniform2fv_with_f32_array(location.as_ref(), &angle);
-                draw(&context, vert_count);
+                angle.set([lat, lon]);
+
+                draw(lat, lon);
             }
         }));
         document.add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref())?;
         closure.forget();
     }
-    // mouse up event
+
+    // mouse release event
     {
         let pressed = pressed.clone();
         let closure: Closure<dyn FnMut(_)> = Closure::wrap(Box::new(move |_event: web_sys::MouseEvent| {
@@ -160,14 +241,57 @@ pub fn start() -> Result<(), JsValue> {
         closure.forget();
     }
 
+    // mouse click event
+    {
+        let closure: Closure<dyn FnMut(_)> = Closure::wrap(Box::new(move |e: web_sys::MouseEvent| {
+            peers.borrow().iter().for_each(|peer| {
+                let (px, py) = (360.0 + peer.x *  360.0, 360.0 - peer.y * 360.0);
+                if (e.client_x() as f64 - px).abs() < 10.0 && (e.client_y() as f64 - py).abs() < 10.0 {
+                    let [mut lat, mut lon] = angle.get();
+                    let (dlat, dlon) = (peer.lat as f32 - lat, peer.lon as f32 + lon);
+                    let angle = angle.clone();
+
+                    // simulate rotation
+                    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+                    let g = f.clone();
+                    let mut i = 0;
+                    {
+                        let draw = draw.clone();
+                        *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+                            if i > 50 {
+                                angle.set([lat, lon]);
+                                let _ = f.borrow_mut().take();
+                                return;
+                            }
+
+                            i += 1;
+
+                            lat += dlat / 50.0;
+                            lon -= dlon / 50.0;
+
+                            draw(lat, lon);
+
+                            window().request_animation_frame(f.borrow().as_ref().unwrap().as_ref().unchecked_ref())
+                                .expect("failed requesting animation frame");
+                        }) as Box<dyn FnMut()>));
+
+                        window().request_animation_frame(g.borrow().as_ref().unwrap().as_ref().unchecked_ref())
+                            .expect("failed requesting animation frame");
+                    }
+                }
+            });
+        }));
+
+        canvas.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
     Ok(())
+
 }
 
-fn draw(context: &WebGl2RenderingContext, vert_count: i32) {
-    context.clear_color(0.98, 0.98, 0.98, 1.0);
-    context.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
-
-    context.draw_arrays(WebGl2RenderingContext::LINE_STRIP, 0, vert_count);
+fn window() -> web_sys::Window {
+    web_sys::window().expect("no global `window` exists")
 }
 
 pub fn compile_shader(context: &WebGl2RenderingContext, shader_type: u32, source: &str) -> Result<WebGlShader, String> {
